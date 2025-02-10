@@ -1,34 +1,29 @@
 from flask import Flask, jsonify
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.chrome.service import Service
-import time
+import asyncio
+from pyppeteer import launch
 
 app = Flask(__name__)
 
 @app.route('/search')
-def search():
-    # 移除 CHROMEDRIVER_PATH
-    service = Service()
-    driver = webdriver.Chrome(service=service)
-
+async def search():
+    browser = await launch()
+    page = await browser.newPage()
+    
     try:
-        driver.get('https://www.baidu.com')
-        search_box = driver.find_element(By.ID, 'kw')
-        search_box.send_keys('python')
-        search_box.send_keys(Keys.RETURN)
-        time.sleep(3)
+        await page.goto('https://www.baidu.com')
+        await page.type('#kw', 'python')
+        await page.keyboard.press('Enter')
+        await page.waitForNavigation()
 
-        results = driver.find_elements(By.CSS_SELECTOR, '.c-container')
+        results = await page.querySelectorAll('.c-container')
         search_results = []
         for index, result in enumerate(results[:5], 1):
-            title = result.find_element(By.CSS_SELECTOR, 'h3').text
+            title = await page.evaluate('(element) => element.querySelector("h3").innerText', result)
             search_results.append(f"{index}. {title}")
         
         return jsonify(search_results)
     finally:
-        driver.quit()
+        await browser.close()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)

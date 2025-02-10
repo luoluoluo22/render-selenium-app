@@ -5,6 +5,7 @@ import nest_asyncio
 import logging
 import random
 import json
+import urllib.parse
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -89,7 +90,8 @@ async def do_search(query):
             '--no-first-run',
             '--no-zygote',
             '--single-process',
-            '--disable-web-security'
+            '--disable-web-security',
+            '--disable-features=IsolateOrigins,site-per-process',
         ],
         headless=True,
         dumpio=True
@@ -121,20 +123,33 @@ async def do_search(query):
     search_results = []
     
     try:
-        # 直接访问搜索页面
-        search_url = f'https://www.zhihu.com/search?type=content&q={query}'
-        logger.info(f"开始访问知乎搜索页面: {search_url}")
-        response = await page.goto(search_url, {
+        # 先访问知乎首页
+        logger.info("访问知乎首页...")
+        await page.goto('https://www.zhihu.com', {
             'waitUntil': 'networkidle0',
             'timeout': 30000
         })
-        logger.info(f"页面加载状态: {response.status}")
+        await page.waitFor(2000)
         
-        # 随机延时
-        await page.waitFor(random.randint(1000, 2000))
+        # 直接访问搜索页面
+        encoded_query = urllib.parse.quote(query)
+        search_url = f'https://www.zhihu.com/search?type=content&q={encoded_query}'
+        logger.info(f"开始访问知乎搜索页面: {search_url}")
+        
+        await page.evaluate(f'''() => {{
+            window.location.href = "{search_url}";
+        }}''')
+        
+        await page.waitForNavigation({
+            'waitUntil': 'networkidle0',
+            'timeout': 30000
+        })
+        
+        logger.info("等待搜索结果加载")
+        await page.waitFor(3000)  # 等待页面完全加载
         
         # 等待搜索结果加载
-        content_selector = '.SearchResult-Card'
+        content_selector = '.SearchResult-Card, .Card.SearchResult-Card'
         await page.waitForSelector(content_selector, {'timeout': 10000})
         logger.info("搜索结果页面加载完成")
 
@@ -145,20 +160,34 @@ async def do_search(query):
         for index, card in enumerate(cards[:5], 1):
             try:
                 # 提取标题和链接
-                title = await page.evaluate('(element) => element.querySelector(".ContentItem-title").innerText', card)
-                link = await page.evaluate('(element) => element.querySelector("a").href', card)
-                # 提取摘要
-                excerpt = await page.evaluate('(element) => element.querySelector(".Highlight").innerText', card)
+                content = await page.evaluate('''(element) => {
+                    const titleEl = element.querySelector('.ContentItem-title');
+                    const linkEl = element.querySelector('a');
+                    const excerptEl = element.querySelector('.Highlight') || element.querySelector('.RichText');
+                    
+                    return {
+                        title: titleEl ? titleEl.innerText.trim() : '',
+                        link: linkEl ? linkEl.href : '',
+                        excerpt: excerptEl ? excerptEl.innerText.trim() : ''
+                    };
+                }''', card)
                 
-                result_text = f"{index}. {title}\n链接：{link}\n摘要：{excerpt}"
+                result_text = f"{index}. {content['title']}\n链接：{content['link']}\n摘要：{content['excerpt']}"
                 logger.info(f"提取第 {index} 个结果: {result_text}")
                 search_results.append(result_text)
             except Exception as e:
                 logger.error(f"提取第 {index} 个结果时出错: {str(e)}")
         
+        if not search_results:
+            # 如果没有找到结果，保存页面截图以便调试
+            await page.screenshot({'path': 'debug_screenshot.png', 'fullPage': True})
+            logger.error("未找到搜索结果，已保存调试截图")
+        
         return search_results
     except Exception as e:
         logger.error(f"搜索过程发生异常: {str(e)}", exc_info=True)
+        # 保存错误页面截图
+        await page.screenshot({'path': 'error_screenshot.png', 'fullPage': True})
         return ["搜索过程发生错误，请稍后重试"]
     finally:
         logger.info("关闭浏览器")

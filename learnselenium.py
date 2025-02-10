@@ -92,9 +92,19 @@ async def do_search(query):
             '--single-process',
             '--disable-web-security',
             '--disable-features=IsolateOrigins,site-per-process',
+            '--disable-site-isolation-trials',
+            '--disable-extensions',
+            '--disable-notifications',
+            '--disable-popup-blocking',
+            '--ignore-certificate-errors',
+            '--no-default-browser-check',
+            '--disable-client-side-phishing-detection',
+            '--disable-component-extensions-with-background-pages',
+            '--blink-settings=imagesEnabled=false'
         ],
         headless=True,
-        dumpio=True
+        dumpio=True,
+        ignoreHTTPSErrors=True
     )
     logger.info("浏览器启动成功")
     
@@ -113,45 +123,49 @@ async def do_search(query):
     await page.setRequestInterception(True)
     
     async def intercept_request(request):
-        if request.resourceType in ['image', 'stylesheet', 'font']:
+        if request.resourceType in ['image', 'stylesheet', 'font', 'media', 'other']:
+            await request.abort()
+        elif request.resourceType == 'script' and 'sentry' in request.url:
             await request.abort()
         else:
             await request.continue_()
     
     page.on('request', lambda req: asyncio.ensure_future(intercept_request(req)))
     
+    # 忽略特定的控制台错误
+    page.on('console', lambda msg: None if any(x in msg.text for x in ['Loading CSS chunk', 'zhihu-advert']) else logger.info(f"Console: {msg.text}"))
+    
     search_results = []
     
     try:
-        # 先访问知乎首页
-        logger.info("访问知乎首页...")
-        await page.goto('https://www.zhihu.com', {
-            'waitUntil': 'networkidle0',
-            'timeout': 30000
-        })
-        await page.waitFor(2000)
-        
         # 直接访问搜索页面
         encoded_query = urllib.parse.quote(query)
         search_url = f'https://www.zhihu.com/search?type=content&q={encoded_query}'
         logger.info(f"开始访问知乎搜索页面: {search_url}")
         
-        await page.evaluate(f'''() => {{
-            window.location.href = "{search_url}";
-        }}''')
-        
-        await page.waitForNavigation({
+        # 设置更长的超时时间
+        response = await page.goto(search_url, {
             'waitUntil': 'networkidle0',
-            'timeout': 30000
+            'timeout': 60000
         })
         
-        logger.info("等待搜索结果加载")
-        await page.waitFor(3000)  # 等待页面完全加载
+        if response.status != 200:
+            logger.error(f"页面加载失败，状态码: {response.status}")
+            return ["页面加载失败，请稍后重试"]
+        
+        logger.info(f"页面加载状态: {response.status}")
         
         # 等待搜索结果加载
         content_selector = '.SearchResult-Card, .Card.SearchResult-Card'
-        await page.waitForSelector(content_selector, {'timeout': 10000})
-        logger.info("搜索结果页面加载完成")
+        try:
+            await page.waitForSelector(content_selector, {'timeout': 20000})
+            logger.info("搜索结果页面加载完成")
+        except Exception as e:
+            logger.error(f"等待搜索结果超时: {str(e)}")
+            # 保存页面内容以便调试
+            content = await page.content()
+            logger.info(f"页面内容: {content[:500]}...")  # 只记录前500个字符
+            return ["等待搜索结果超时，请稍后重试"]
 
         # 获取搜索结果
         cards = await page.querySelectorAll(content_selector)
@@ -163,7 +177,9 @@ async def do_search(query):
                 content = await page.evaluate('''(element) => {
                     const titleEl = element.querySelector('.ContentItem-title');
                     const linkEl = element.querySelector('a');
-                    const excerptEl = element.querySelector('.Highlight') || element.querySelector('.RichText');
+                    const excerptEl = element.querySelector('.Highlight') || 
+                                    element.querySelector('.RichText') ||
+                                    element.querySelector('.SearchItem-excerpt');
                     
                     return {
                         title: titleEl ? titleEl.innerText.trim() : '',
@@ -172,9 +188,10 @@ async def do_search(query):
                     };
                 }''', card)
                 
-                result_text = f"{index}. {content['title']}\n链接：{content['link']}\n摘要：{content['excerpt']}"
-                logger.info(f"提取第 {index} 个结果: {result_text}")
-                search_results.append(result_text)
+                if content['title'] or content['excerpt']:
+                    result_text = f"{index}. {content['title']}\n链接：{content['link']}\n摘要：{content['excerpt']}"
+                    logger.info(f"提取第 {index} 个结果: {result_text}")
+                    search_results.append(result_text)
             except Exception as e:
                 logger.error(f"提取第 {index} 个结果时出错: {str(e)}")
         
@@ -182,6 +199,7 @@ async def do_search(query):
             # 如果没有找到结果，保存页面截图以便调试
             await page.screenshot({'path': 'debug_screenshot.png', 'fullPage': True})
             logger.error("未找到搜索结果，已保存调试截图")
+            return ["未找到搜索结果，请稍后重试"]
         
         return search_results
     except Exception as e:

@@ -5,7 +5,11 @@ from pyppeteer import launch
 app = Flask(__name__)
 
 @app.route('/search')
-async def search():
+def search():
+    result = asyncio.run(do_search())
+    return jsonify(result)
+
+async def do_search():
     browser = await launch()
     page = await browser.newPage()
     
@@ -21,7 +25,7 @@ async def search():
             title = await page.evaluate('(element) => element.querySelector("h3").innerText', result)
             search_results.append(f"{index}. {title}")
         
-        return jsonify(search_results)
+        return search_results
     finally:
         await browser.close()
 

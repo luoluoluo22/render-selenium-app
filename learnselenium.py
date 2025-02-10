@@ -1,9 +1,10 @@
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 import asyncio
 from pyppeteer import launch
 import nest_asyncio
 import logging
 import random
+import json
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -12,17 +13,60 @@ logger = logging.getLogger(__name__)
 nest_asyncio.apply()
 app = Flask(__name__)
 
+# 存储知乎 cookies
+ZHIHU_COOKIES = None
+
+def parse_cookie_string(cookie_str):
+    """解析 cookie 字符串为对象数组"""
+    cookies = []
+    for cookie in cookie_str.split(';'):
+        cookie = cookie.strip()
+        if cookie:
+            name, value = cookie.split('=', 1)
+            cookies.append({
+                'name': name.strip(),
+                'value': value.strip(),
+                'domain': '.zhihu.com'
+            })
+    return cookies
+
 @app.route('/')
 def home():
     return "Welcome to Search API"
 
+@app.route('/set_cookies', methods=['POST'])
+def set_cookies():
+    global ZHIHU_COOKIES
+    try:
+        # 支持两种格式：字符串格式和对象数组格式
+        data = request.json
+        if isinstance(data, str):
+            ZHIHU_COOKIES = parse_cookie_string(data)
+        elif isinstance(data, dict) and 'cookies' in data:
+            if isinstance(data['cookies'], str):
+                ZHIHU_COOKIES = parse_cookie_string(data['cookies'])
+            else:
+                ZHIHU_COOKIES = data['cookies']
+        else:
+            ZHIHU_COOKIES = data
+            
+        logger.info(f"成功设置 {len(ZHIHU_COOKIES)} 个 cookies")
+        return jsonify({"message": "Cookies 设置成功", "count": len(ZHIHU_COOKIES)})
+    except Exception as e:
+        logger.error(f"设置 cookies 失败: {str(e)}")
+        return jsonify({"error": str(e)}), 400
+
 @app.route('/search')
 def search():
-    logger.info("开始处理搜索请求")
+    query = request.args.get('q', 'python')  # 获取搜索关键词，默认为 python
+    logger.info(f"开始处理搜索请求: {query}")
+    if not ZHIHU_COOKIES:
+        return jsonify({"error": "请先设置知乎 cookies"}), 400
+    
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        result = loop.run_until_complete(do_search())
+        result = loop.run_until_complete(do_search(query))
         logger.info(f"搜索完成，结果: {result}")
         return jsonify(result)
     except Exception as e:
@@ -31,7 +75,7 @@ def search():
     finally:
         loop.close()
 
-async def do_search():
+async def do_search(query):
     logger.info("启动浏览器")
     browser = await launch(
         handleSIGINT=False,
@@ -58,6 +102,11 @@ async def do_search():
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36')
     await page.setViewport({'width': 1920, 'height': 1080})
     
+    # 注入 cookies
+    logger.info("注入知乎 cookies")
+    for cookie in ZHIHU_COOKIES:
+        await page.setCookie(cookie)
+    
     # 设置请求拦截
     await page.setRequestInterception(True)
     
@@ -72,8 +121,10 @@ async def do_search():
     search_results = []
     
     try:
-        logger.info("开始访问百度")
-        response = await page.goto('https://www.baidu.com', {
+        # 直接访问搜索页面
+        search_url = f'https://www.zhihu.com/search?type=content&q={query}'
+        logger.info(f"开始访问知乎搜索页面: {search_url}")
+        response = await page.goto(search_url, {
             'waitUntil': 'networkidle0',
             'timeout': 30000
         })
@@ -82,41 +133,28 @@ async def do_search():
         # 随机延时
         await page.waitFor(random.randint(1000, 2000))
         
-        logger.info("等待搜索框加载")
-        await page.waitForSelector('#kw', {'timeout': 10000})
-        logger.info("搜索框加载完成")
-        
-        logger.info("输入搜索关键词")
-        # 模拟人类输入
-        for char in "python":
-            await page.type('#kw', char)
-            await page.waitFor(random.randint(50, 150))
-        
-        await page.waitFor(random.randint(500, 1000))
-        await page.keyboard.press('Enter')
-        
-        logger.info("等待搜索结果加载")
-        try:
-            # 首先检查是否出现验证码
-            captcha_selector = '#wappass-captcha-iframe'
-            await page.waitForSelector(captcha_selector, {'timeout': 5000})
-            logger.error("检测到验证码，搜索失败")
-            return ["检测到验证码，请稍后重试"]
-        except Exception:
-            # 如果没有验证码，继续等待搜索结果
-            await page.waitForSelector('.c-container', {'timeout': 10000})
-            logger.info("搜索结果页面加载完成")
+        # 等待搜索结果加载
+        content_selector = '.SearchResult-Card'
+        await page.waitForSelector(content_selector, {'timeout': 10000})
+        logger.info("搜索结果页面加载完成")
 
-            results = await page.querySelectorAll('.c-container')
-            logger.info(f"找到 {len(results)} 个搜索结果")
-            
-            for index, result in enumerate(results[:5], 1):
-                try:
-                    title = await page.evaluate('(element) => element.querySelector("h3").innerText', result)
-                    logger.info(f"提取第 {index} 个结果: {title}")
-                    search_results.append(f"{index}. {title}")
-                except Exception as e:
-                    logger.error(f"提取第 {index} 个结果时出错: {str(e)}")
+        # 获取搜索结果
+        cards = await page.querySelectorAll(content_selector)
+        logger.info(f"找到 {len(cards)} 个搜索结果")
+        
+        for index, card in enumerate(cards[:5], 1):
+            try:
+                # 提取标题和链接
+                title = await page.evaluate('(element) => element.querySelector(".ContentItem-title").innerText', card)
+                link = await page.evaluate('(element) => element.querySelector("a").href', card)
+                # 提取摘要
+                excerpt = await page.evaluate('(element) => element.querySelector(".Highlight").innerText', card)
+                
+                result_text = f"{index}. {title}\n链接：{link}\n摘要：{excerpt}"
+                logger.info(f"提取第 {index} 个结果: {result_text}")
+                search_results.append(result_text)
+            except Exception as e:
+                logger.error(f"提取第 {index} 个结果时出错: {str(e)}")
         
         return search_results
     except Exception as e:
